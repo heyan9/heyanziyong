@@ -43,6 +43,9 @@ object Store {
     var autoInterval: Int
         get() = sp.getInt("autoSec", 20)
         set(v) = sp.edit().putInt("autoSec", v).apply()
+    var opacity: Int
+        get() = sp.getInt("opacity", 90)
+        set(v) = sp.edit().putInt("opacity", v).apply()
     var activeId: String
         get() = s("activeId", "default")
         set(v) = put("activeId", v)

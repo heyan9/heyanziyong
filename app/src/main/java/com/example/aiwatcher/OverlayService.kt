@@ -4,6 +4,7 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.content.res.ColorStateList
 import android.graphics.*
 import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
@@ -20,8 +21,11 @@ import android.speech.tts.UtteranceProgressListener
 import android.util.DisplayMetrics
 import android.view.*
 import android.widget.*
+import java.io.File
 import java.util.Locale
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.abs
+import kotlin.math.max
 
 class OverlayService : Service() {
     private val main = Handler(Looper.getMainLooper())
@@ -32,11 +36,13 @@ class OverlayService : Service() {
     private lateinit var root: LinearLayout
     private lateinit var lp: WindowManager.LayoutParams
     private lateinit var panel: LinearLayout
+    private lateinit var panelBg: GradientDrawable
+    private lateinit var bubble: ImageView
     private lateinit var replyView: TextView
-    private lateinit var personaBtn: Button
-    private lateinit var micBtn: Button
-    private lateinit var screenBtn: Button
-    private lateinit var ttsBtn: Button
+    private lateinit var personaBtn: TextView
+    private lateinit var micBtn: TextView
+    private lateinit var screenBtn: TextView
+    private lateinit var ttsBtn: TextView
 
     private var projection: MediaProjection? = null
     private var vd: VirtualDisplay? = null
@@ -53,6 +59,7 @@ class OverlayService : Service() {
     @Volatile private var speaking = false
     @Volatile private var busy = false
     private val history = ArrayList<Pair<String, String>>()
+    private val masks = CopyOnWriteArrayList<Mask>()
 
     override fun onBind(i: Intent?): IBinder? = null
 
@@ -102,6 +109,17 @@ class OverlayService : Service() {
         }
     }
 
+    /** 把所有遮挡框区域涂黑,AI 永远看不到这些位置 */
+    private fun applyMasks(b: Bitmap) {
+        if (masks.isEmpty()) return
+        val c = Canvas(b)
+        val p = Paint().apply { color = Color.BLACK }
+        masks.forEach {
+            c.drawRect(it.lp.x.toFloat(), it.lp.y.toFloat(),
+                (it.lp.x + it.lp.width).toFloat(), (it.lp.y + it.lp.height).toFloat(), p)
+        }
+    }
+
     private fun setupProjection(code: Int, data: Intent) {
         val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         val mp = mpm.getMediaProjection(code, data)
@@ -125,6 +143,7 @@ class OverlayService : Service() {
                 val full = Bitmap.createBitmap(iw + pad / p.pixelStride, ih, Bitmap.Config.ARGB_8888)
                 full.copyPixelsFromBuffer(p.buffer)
                 val bmp = if (full.width == iw) full else Bitmap.createBitmap(full, 0, 0, iw, ih).also { full.recycle() }
+                applyMasks(bmp)
                 latest = bmp
                 onFrame(bmp)
             } finally { img.close() }
@@ -153,7 +172,8 @@ class OverlayService : Service() {
         busy = true
         if (!auto) main.post { replyView.text = "思考中…" }
         val persona = Store.active()
-        val frame = if (Store.useScreen) latest else null
+        // 发送前再涂一次黑(遮挡框可能刚被移动过)
+        val frame = if (Store.useScreen) latest?.copy(Bitmap.Config.ARGB_8888, true)?.also { applyMasks(it) } else null
         Thread {
             try {
                 val out = Ai.chat(persona, history, text, frame)
@@ -162,7 +182,7 @@ class OverlayService : Service() {
                 val skip = auto && out.trim().trimEnd('。', '.') == "无"
                 if (!skip) main.post {
                     replyView.text = out
-                    if (!Store.tts && panel.visibility != View.VISIBLE) panel.visibility = View.VISIBLE
+                    if (!Store.tts && panel.visibility != View.VISIBLE) showPanel(true)
                     speak(out)
                 }
             } catch (e: Exception) {
@@ -221,67 +241,208 @@ class OverlayService : Service() {
         }
         listening = on
         micBtn.text = if (on) "🎤 聆听中(点击停止)" else "🎤 开始聆听"
+        setOn(micBtn, on)
         if (on) beginRec() else recognizer?.cancel()
+    }
+
+    // ---------------- 遮挡框 ----------------
+    /** 黑色遮挡框:点一下删除,长按后拖动移动,拖右下角 ◢ 调整大小 */
+    private inner class Mask {
+        val lp = WindowManager.LayoutParams(
+            dp(200), dp(120), WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                    or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            val (sw, sh, _) = screenSize()
+            x = (sw - dp(200)) / 2; y = sh / 3
+        }
+        val view = FrameLayout(this@OverlayService).apply { setBackgroundColor(Color.BLACK) }
+
+        fun remove() {
+            try { wm.removeView(view) } catch (_: Exception) {}
+            masks.remove(this)
+        }
+
+        init {
+            val handle = TextView(this@OverlayService).apply {
+                text = "◢"; setTextColor(0xFF4DA8FF.toInt()); textSize = 20f; gravity = Gravity.CENTER
+                layoutParams = FrameLayout.LayoutParams(dp(40), dp(40), Gravity.BOTTOM or Gravity.END)
+            }
+            view.addView(handle)
+
+            var rw = 0; var rh = 0; var rx = 0f; var ry = 0f
+            handle.setOnTouchListener { _, e ->
+                when (e.action) {
+                    MotionEvent.ACTION_DOWN -> { rw = lp.width; rh = lp.height; rx = e.rawX; ry = e.rawY }
+                    MotionEvent.ACTION_MOVE -> {
+                        lp.width = max(dp(40), rw + (e.rawX - rx).toInt())
+                        lp.height = max(dp(40), rh + (e.rawY - ry).toInt())
+                        wm.updateViewLayout(view, lp)
+                    }
+                }
+                true
+            }
+
+            var sx = 0; var sy = 0; var tx = 0f; var ty = 0f
+            var dragging = false; var moved = false
+            val longPress = Runnable {
+                dragging = true
+                view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            }
+            view.setOnTouchListener { _, e ->
+                when (e.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        sx = lp.x; sy = lp.y; tx = e.rawX; ty = e.rawY
+                        dragging = false; moved = false
+                        main.postDelayed(longPress, 350)
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        val dx = (e.rawX - tx).toInt(); val dy = (e.rawY - ty).toInt()
+                        if (!dragging && (abs(dx) > dp(8) || abs(dy) > dp(8))) {
+                            moved = true; main.removeCallbacks(longPress)
+                        }
+                        if (dragging) { lp.x = sx + dx; lp.y = sy + dy; wm.updateViewLayout(view, lp) }
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        main.removeCallbacks(longPress)
+                        if (!dragging && !moved) remove()
+                        dragging = false
+                    }
+                    MotionEvent.ACTION_CANCEL -> { main.removeCallbacks(longPress); dragging = false }
+                }
+                true
+            }
+            wm.addView(view, lp)
+            masks.add(this)
+        }
     }
 
     // ---------------- 悬浮窗界面 ----------------
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
-    private fun btn(label: String, onClick: () -> Unit) = Button(this).apply {
-        text = label; textSize = 12f; isAllCaps = false
-        minHeight = 0; minimumHeight = 0; setPadding(dp(8), dp(4), dp(8), dp(4))
+    private fun rounded(color: Int, r: Int = 18) =
+        GradientDrawable().apply { cornerRadius = dp(r).toFloat(); setColor(color) }
+
+    private fun blueGrad(r: Int = 18) = GradientDrawable(
+        GradientDrawable.Orientation.LEFT_RIGHT, intArrayOf(0xFF0084FF.toInt(), 0xFF4DA8FF.toInt())
+    ).apply { cornerRadius = dp(r).toFloat() }
+
+    private fun setOn(v: TextView, on: Boolean) { v.background = if (on) blueGrad() else rounded(0x26FFFFFF) }
+
+    private fun pill(label: String, on: Boolean = false, onClick: () -> Unit) = TextView(this).apply {
+        text = label; setTextColor(Color.WHITE); textSize = 12.5f; gravity = Gravity.CENTER
+        setPadding(dp(6), dp(9), dp(6), dp(9)); setOn(this, on)
         setOnClickListener { onClick() }
+    }
+
+    private fun row(vararg v: View) = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        v.forEach {
+            addView(it, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                .apply { setMargins(dp(3), dp(3), dp(3), dp(3)) })
+        }
+    }
+
+    private fun label(t: String, size: Float = 11f, color: Int = 0x99FFFFFF.toInt()) = TextView(this).apply {
+        text = t; textSize = size; setTextColor(color); setPadding(dp(4), dp(6), dp(4), dp(2))
+    }
+
+    private fun showPanel(show: Boolean) {
+        panel.visibility = if (show) View.VISIBLE else View.GONE
+        applyOpacity()
+    }
+
+    private fun applyOpacity() {
+        val o = Store.opacity.coerceIn(20, 100)
+        panelBg.alpha = o * 255 / 100
+        bubble.alpha = o / 100f
     }
 
     private fun buildOverlay() {
         root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        val bubble = TextView(this).apply {
-            text = "AI"; setTextColor(Color.WHITE); textSize = 16f; gravity = Gravity.CENTER
-            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(0xFF6750A4.toInt()) }
-            layoutParams = LinearLayout.LayoutParams(dp(52), dp(52))
+        bubble = ImageView(this).apply {
+            val f = File(filesDir, "avatar.png")
+            if (f.exists()) setImageBitmap(BitmapFactory.decodeFile(f.path)) else setImageResource(R.drawable.avatar)
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL; setColor(0xFF0084FF.toInt()); setStroke(dp(2), 0xCCFFFFFF.toInt())
+            }
+            outlineProvider = ViewOutlineProvider.BACKGROUND; clipToOutline = true
+            layoutParams = LinearLayout.LayoutParams(dp(54), dp(54))
         }
+
+        panelBg = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(0xFF182338.toInt(), 0xFF0C1220.toInt())
+        ).apply { cornerRadius = dp(22).toFloat(); setStroke(dp(1), 0x40FFFFFF) }
 
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; visibility = View.GONE
-            setPadding(dp(10), dp(10), dp(10), dp(10))
-            background = GradientDrawable().apply { cornerRadius = dp(14).toFloat(); setColor(0xEE222222.toInt()) }
-            layoutParams = LinearLayout.LayoutParams(dp(280), ViewGroup.LayoutParams.WRAP_CONTENT)
+            setPadding(dp(10), dp(10), dp(10), dp(10)); background = panelBg
+            layoutParams = LinearLayout.LayoutParams(dp(290), ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) }
         }
 
-        personaBtn = btn("角色:" + Store.active().name) {
+        personaBtn = pill("角色:" + Store.active().name, on = true) {
             val l = Store.personas()
             val next = l[(l.indexOfFirst { it.id == Store.activeId } + 1) % l.size]
             Store.activeId = next.id; history.clear()
             personaBtn.text = "角色:" + next.name
         }
-        micBtn = btn("🎤 开始聆听") { setListening(!listening) }
-        screenBtn = btn(if (Store.useScreen) "👁 监看:开" else "👁 监看:关") {
+        micBtn = pill("🎤 开始聆听") { setListening(!listening) }
+        screenBtn = pill(if (Store.useScreen) "👁 监看:开" else "👁 监看:关", Store.useScreen) {
             Store.useScreen = !Store.useScreen
             screenBtn.text = if (Store.useScreen) "👁 监看:开" else "👁 监看:关"
+            setOn(screenBtn, Store.useScreen)
         }
-        ttsBtn = btn(if (Store.tts) "🔊 语音:开" else "🔊 语音:关") {
+        ttsBtn = pill(if (Store.tts) "🔊 语音:开" else "🔊 语音:关", Store.tts) {
             Store.tts = !Store.tts
             ttsBtn.text = if (Store.tts) "🔊 语音:开" else "🔊 语音:关"
+            setOn(ttsBtn, Store.tts)
             if (!Store.tts) tts?.stop()
         }
-        val lookBtn = btn("👀 看看我的屏幕") { ask("请看看我现在的屏幕,说说你的看法。") }
-        val closeBtn = btn("退出助手") { stopSelf() }
+        val lookBtn = pill("👀 看看屏幕") { ask("请看看我现在的屏幕,说说你的看法。") }
+        val quitBtn = pill("退出助手") { stopSelf() }
+        val addMask = pill("⬛ 新建遮挡框") { Mask() }
+        val clearMask = pill("清除遮挡框") { masks.toList().forEach { it.remove() } }
 
-        replyView = TextView(this).apply { setTextColor(Color.WHITE); textSize = 14f; text = "点“开始聆听”直接对我说话" }
+        val seek = SeekBar(this).apply {
+            max = 80; progress = Store.opacity.coerceIn(20, 100) - 20
+            progressTintList = ColorStateList.valueOf(0xFF4DA8FF.toInt())
+            thumbTintList = ColorStateList.valueOf(0xFF4DA8FF.toInt())
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                    Store.opacity = p + 20; applyOpacity()
+                }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+            })
+        }
+        val opRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            addView(label("透明度"))
+            addView(seek, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }
+
+        replyView = TextView(this).apply {
+            setTextColor(Color.WHITE); textSize = 14f; setLineSpacing(0f, 1.15f)
+            text = "点“开始聆听”直接对我说话"; setPadding(dp(8), dp(6), dp(8), dp(6))
+        }
         val scroll = ScrollView(this).apply {
-            addView(replyView)
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(150)).apply { topMargin = dp(8) }
+            background = rounded(0x14FFFFFF, 14); addView(replyView)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(140)).apply { topMargin = dp(8) }
         }
 
-        fun row(vararg v: View) = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            v.forEach { addView(it, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)) }
-        }
-        panel.addView(personaBtn)
+        panel.addView(label("AI 屏幕助手", 14f, Color.WHITE))
+        panel.addView(row(personaBtn))
         panel.addView(row(micBtn))
         panel.addView(row(screenBtn, ttsBtn))
-        panel.addView(row(lookBtn, closeBtn))
+        panel.addView(row(lookBtn, quitBtn))
+        panel.addView(label("工具"))
+        panel.addView(row(addMask, clearMask))
+        panel.addView(label("遮挡框:长按拖动 · 拖 ◢ 缩放 · 点一下删除。框内区域 AI 看不到", 10f))
+        panel.addView(opRow)
         panel.addView(scroll)
 
         root.addView(bubble); root.addView(panel)
@@ -302,17 +463,18 @@ class OverlayService : Service() {
                         if (abs(dx) > 10 || abs(dy) > 10) moved = true
                         lp.x = sx + dx; lp.y = sy + dy; wm.updateViewLayout(root, lp)
                     }
-                    MotionEvent.ACTION_UP -> if (!moved)
-                        panel.visibility = if (panel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+                    MotionEvent.ACTION_UP -> if (!moved) showPanel(panel.visibility != View.VISIBLE)
                 }
                 return true
             }
         })
+        applyOpacity()
         wm.addView(root, lp)
     }
 
     override fun onDestroy() {
         listening = false
+        masks.toList().forEach { it.remove() }
         try { wm.removeView(root) } catch (_: Exception) {}
         recognizer?.destroy(); tts?.shutdown()
         vd?.release(); reader?.close(); projection?.stop(); bgThread.quitSafely()
